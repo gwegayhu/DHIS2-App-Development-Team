@@ -28,40 +28,25 @@ package org.hisp.dhis.program;
  * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-import static org.apache.commons.lang3.StringUtils.trim;
+import static org.hisp.dhis.parser.ParserUtils.castClass;
+import static org.hisp.dhis.parser.ParserUtils.castString;
 
-import java.util.Date;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
-import java.util.regex.Matcher;
+import java.util.*;
 
 import org.apache.commons.lang.StringUtils;
-import org.hisp.dhis.api.util.DateUtils;
+import org.hisp.dhis.common.IdentifiableObjectManager;
 import org.hisp.dhis.common.IdentifiableObjectStore;
-import org.hisp.dhis.commons.sqlfunc.ConditionalSqlFunction;
-import org.hisp.dhis.commons.sqlfunc.HasValueSqlFunction;
-import org.hisp.dhis.commons.sqlfunc.OneIfZeroOrPositiveSqlFunction;
-import org.hisp.dhis.commons.sqlfunc.RelationshipCountSqlFunction;
-import org.hisp.dhis.commons.sqlfunc.SqlFunction;
-import org.hisp.dhis.commons.sqlfunc.ZeroIfNegativeSqlFunction;
-import org.hisp.dhis.commons.sqlfunc.ZeroPositiveValueCountFunction;
-import org.hisp.dhis.commons.util.ExpressionUtils;
 import org.hisp.dhis.commons.util.TextUtils;
-import org.hisp.dhis.constant.Constant;
 import org.hisp.dhis.constant.ConstantService;
-import org.hisp.dhis.dataelement.DataElement;
 import org.hisp.dhis.dataelement.DataElementService;
-import org.hisp.dhis.i18n.I18n;
 import org.hisp.dhis.i18n.I18nManager;
 import org.hisp.dhis.jdbc.StatementBuilder;
-import org.hisp.dhis.system.util.ValidationUtils;
-import org.hisp.dhis.trackedentity.TrackedEntityAttribute;
+import org.hisp.dhis.parser.Parser;
+import org.hisp.dhis.parser.ParserException;
+import org.hisp.dhis.relationship.RelationshipTypeService;
 import org.hisp.dhis.trackedentity.TrackedEntityAttributeService;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.transaction.annotation.Transactional;
-
-import com.google.common.collect.ImmutableMap;
 
 /**
  * @author Chau Thu Tran
@@ -124,10 +109,16 @@ public class DefaultProgramIndicatorService
     }
 
     @Autowired
+    private IdentifiableObjectManager manager;
+
+    @Autowired
+    private RelationshipTypeService relationshipTypeService;
+
+    @Autowired
     private I18nManager i18nManager;
 
     // -------------------------------------------------------------------------
-    // ProgramIndicatorService implementation
+    // ProgramIndicator CRUD
     // -------------------------------------------------------------------------
 
     @Transactional
@@ -174,6 +165,118 @@ public class DefaultProgramIndicatorService
     }
 
     // -------------------------------------------------------------------------
+    // ProgramIndicator logic
+    // -------------------------------------------------------------------------
+
+    @Override
+    @Transactional
+    @Deprecated public String getUntypedDescription( String expression )
+    {
+        return getDescription( expression, null );
+    }
+
+    @Override
+    @Transactional
+    public String getExpressionDescription( String expression )
+    {
+        return getDescription( expression, Double.class );
+    }
+
+    @Override
+    @Transactional
+    public String getFilterDescription( String expression )
+    {
+        return getDescription( expression, Boolean.class );
+    }
+
+    @Override
+    @Transactional
+    public boolean expressionIsValid( String expression )
+    {
+        return isValid( expression, Double.class );
+    }
+
+    @Override
+    @Transactional
+    public boolean filterIsValid( String filter )
+    {
+        return isValid( filter, Boolean.class );
+    }
+
+    @Override
+    public void validate( String expression, Class clazz, Map<String, String> itemDescriptions )
+    {
+        ProgramValidator programExpressionValidator = new ProgramValidator(
+            this, constantService, programStageService,
+            dataElementService, attributeService, relationshipTypeService,
+            i18nManager.getI18n(), itemDescriptions );
+
+        castClass( clazz, Parser.visit( expression, programExpressionValidator ) );
+    }
+
+    @Override
+    public String getExpressionAnalyticsSql( ProgramIndicator programIndicator, Date startDate, Date endDate )
+    {
+        return getAnalyticsSql( programIndicator.getExpression(), programIndicator, startDate, endDate, true );
+    }
+
+    @Override
+    public String getFilterAnalyticsSql( ProgramIndicator programIndicator, Date startDate, Date endDate )
+    {
+        return getAnalyticsSql( programIndicator.getFilter(), programIndicator, startDate, endDate, false );
+    }
+
+    @Override
+    public String getAnalyticsSql( String expression, ProgramIndicator programIndicator, Date startDate, Date endDate, boolean ignoreMissingValues )
+    {
+        if ( expression == null )
+        {
+            return null;
+        }
+
+        Set<String> dataElementAndAttributeIdentifiers = getDataElementAndAttributeIdentifiers(
+            expression, programIndicator.getAnalyticsType() );
+
+        ProgramSqlGenerator programSqlGenerator = new ProgramSqlGenerator( programIndicator, startDate, endDate,
+            ignoreMissingValues, dataElementAndAttributeIdentifiers, constantService.getConstantMap(),
+            this, statementBuilder, dataElementService, attributeService );
+
+        return castString( Parser.visit( expression, programSqlGenerator ) );
+    }
+
+    @Override
+    public String getAnyValueExistsClauseAnalyticsSql( String expression, AnalyticsType analyticsType )
+    {
+        if ( expression == null )
+        {
+            return null;
+        }
+
+        try
+        {
+            Set<String> uids = getDataElementAndAttributeIdentifiers( expression, analyticsType );
+
+            if ( uids.isEmpty() )
+            {
+                return null;
+            }
+
+            String sql = StringUtils.EMPTY;
+
+            for ( String uid : uids )
+            {
+                sql += statementBuilder.columnQuote( uid ) + " is not null or ";
+            }
+
+            return TextUtils.removeLastOr( sql ).trim();
+        }
+        catch ( ParserException e )
+        {
+            return null;
+        }
+    }
+
+    // -------------------------------------------------------------------------
     // ProgramIndicatorGroup
     // -------------------------------------------------------------------------
 
@@ -216,4 +319,51 @@ public class DefaultProgramIndicatorService
     {
         return programIndicatorGroupStore.getAll();
     }
-}
+
+    // -------------------------------------------------------------------------
+    // Supportive methods
+    // -------------------------------------------------------------------------
+
+    private String getDescription( String expression, Class clazz )
+    {
+        Map<String, String> itemDescriptions = new HashMap<>();
+
+        validate( expression, clazz, itemDescriptions );
+
+        String description = expression;
+
+        for ( Map.Entry<String, String> entry : itemDescriptions.entrySet() )
+        {
+            description = description.replace( entry.getKey(), entry.getValue() );
+        }
+
+        return description;
+    }
+
+    private boolean isValid( String expression, Class clazz )
+    {
+        if ( expression != null )
+        {
+            try
+            {
+                validate( expression, clazz, new HashMap<>() );
+            }
+            catch ( ParserException e )
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private Set<String> getDataElementAndAttributeIdentifiers( String expression, AnalyticsType analyticsType )
+    {
+        Set<String> items = new HashSet<>();
+
+        ProgramElementsAndAttributesCollecter listener = new ProgramElementsAndAttributesCollecter( items, analyticsType );
+
+        Parser.listen( expression, listener );
+
+        return items;
+    }}
